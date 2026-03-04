@@ -1,0 +1,21 @@
+version = 0.1
+
+[default]
+[default.deploy]
+[default.deploy.parameters]
+stack_name = "daily-report-stack"
+s3_bucket = "your-sam-deployment-bucket"
+s3_prefix = "daily-report"
+region = "ap-northeast-1"
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = [
+    "Timezone=Asia/Tokyo",
+    "ScheduleExpression=cron(30 8 * * ? *)",
+    "AllowedUsers=",
+    "AllowedChannels=",
+    "LogRetentionDays=14"
+]
+
+[default.build]
+[default.build.parameters]
+use_container = true

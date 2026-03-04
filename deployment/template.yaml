@@ -1,0 +1,273 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Daily Report Slack Bot Infrastructure (Secure)
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Timeout: 300
+    MemorySize: 512
+    Environment:
+      Variables:
+        USE_SECRETS_MANAGER: 'true'
+        TIMEZONE: !Ref Timezone
+        ALLOWED_USERS: !Ref AllowedUsers
+        ALLOWED_CHANNELS: !Ref AllowedChannels
+
+Parameters:
+  Timezone:
+    Type: String
+    Default: Asia/Tokyo
+    Description: Timezone for scheduling and date calculations
+  
+  ScheduleExpression:
+    Type: String
+    Default: cron(30 8 * * ? *)
+    Description: Schedule expression (17:30 JST = 08:30 UTC = cron(30 8 * * ? *))
+  
+  AllowedUsers:
+    Type: String
+    Default: ''
+    Description: Comma-separated list of allowed Slack user IDs (empty = allow all)
+  
+  AllowedChannels:
+    Type: String
+    Default: ''
+    Description: Comma-separated list of allowed channel IDs for slash command (empty = allow all)
+  
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    Description: CloudWatch Logs retention period in days
+
+Resources:
+  # Secrets Manager: Store all sensitive credentials
+  DailyReportSecrets:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: daily-report/credentials
+      Description: Credentials for Daily Report Bot
+      SecretString: !Sub |
+        {
+          "slack_bot_token": "PLACEHOLDER_UPDATE_AFTER_DEPLOY",
+          "slack_signing_secret": "PLACEHOLDER_UPDATE_AFTER_DEPLOY",
+          "slack_channel_id": "PLACEHOLDER_UPDATE_AFTER_DEPLOY",
+          "github_token": "PLACEHOLDER_UPDATE_AFTER_DEPLOY",
+          "github_username": "PLACEHOLDER_UPDATE_AFTER_DEPLOY",
+          "google_calendar_credentials": "PLACEHOLDER_UPDATE_AFTER_DEPLOY",
+          "google_calendar_id": "primary",
+          "openai_api_key": "PLACEHOLDER_UPDATE_AFTER_DEPLOY",
+          "openai_model": "gpt-4-turbo-preview",
+          "timezone": "${Timezone}"
+        }
+  
+  # Lambda: Slash Command Handler
+  SlashCommandFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: daily-report-slash-command
+      CodeUri: ../src/
+      Handler: handlers.slash_command.lambda_handler
+      Description: Handle Slack slash command for daily report
+      Environment:
+        Variables:
+          DAILY_REPORT_GENERATOR_ARN: !GetAtt ReportGeneratorFunction.Arn
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: InvokeReportGenerator
+              Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource: !GetAtt ReportGeneratorFunction.Arn
+            - Sid: ReadSecrets
+              Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref DailyReportSecrets
+      Events:
+        SlackCommand:
+          Type: Api
+          Properties:
+            Path: /slack/command
+            Method: POST
+            RestApiId: !Ref DailyReportApi
+  
+  # Lambda: Daily Report Generator
+  ReportGeneratorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: daily-report-generator
+      CodeUri: ../src/
+      Handler: handlers.report_generator.lambda_handler
+      Description: Generate and post daily report to Slack
+      Timeout: 600
+      MemorySize: 1024
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: ReadSecrets
+              Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref DailyReportSecrets
+      Events:
+        ScheduledReport:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref ScheduleExpression
+            Description: Daily report at 17:30 JST
+            Enabled: true
+  
+  # API Gateway
+  DailyReportApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: daily-report-api
+      StageName: prod
+      Cors:
+        AllowMethods: "'POST'"
+        AllowHeaders: "'Content-Type,X-Slack-Request-Timestamp,X-Slack-Signature'"
+        AllowOrigin: "'*'"
+      # Rate limiting (basic throttling)
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+      # Access logging
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: '$context.requestId $context.error.message $context.error.messageString'
+  
+  # CloudWatch Log Groups with encryption
+  SlashCommandLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${SlashCommandFunction}
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt LogEncryptionKey.Arn
+  
+  ReportGeneratorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ReportGeneratorFunction}
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt LogEncryptionKey.Arn
+  
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/apigateway/${DailyReportApi}-access-logs
+      RetentionInDays: !Ref LogRetentionDays
+  
+  # KMS Key for log encryption
+  LogEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for encrypting Daily Report logs
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM policies
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:CreateGrant'
+              - 'kms:DescribeKey'
+            Resource: '*'
+            Condition:
+              ArnLike:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+  
+  LogEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/daily-report-logs
+      TargetKeyId: !Ref LogEncryptionKey
+  
+  # CloudWatch Alarms
+  SlashCommandErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: daily-report-slash-command-errors
+      AlarmDescription: Alert when slash command has high error rate
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SlashCommandFunction
+      TreatMissingData: notBreaching
+  
+  ReportGeneratorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: daily-report-generator-errors
+      AlarmDescription: Alert when report generator has errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ReportGeneratorFunction
+      TreatMissingData: notBreaching
+
+Outputs:
+  SlashCommandApiUrl:
+    Description: API Gateway endpoint URL for Slack slash command
+    Value: !Sub https://${DailyReportApi}.execute-api.${AWS::Region}.amazonaws.com/prod/slack/command
+  
+  SlashCommandFunctionArn:
+    Description: Slash Command Lambda Function ARN
+    Value: !GetAtt SlashCommandFunction.Arn
+  
+  ReportGeneratorFunctionArn:
+    Description: Report Generator Lambda Function ARN
+    Value: !GetAtt ReportGeneratorFunction.Arn
+  
+  ApiGatewayId:
+    Description: API Gateway ID
+    Value: !Ref DailyReportApi
+  
+  SecretsManagerArn:
+    Description: Secrets Manager secret ARN
+    Value: !Ref DailyReportSecrets
+    Export:
+      Name: DailyReportSecretsArn
+  
+  UpdateSecretsCommand:
+    Description: Command to update secrets after deployment
+    Value: !Sub |
+      aws secretsmanager put-secret-value --secret-id ${DailyReportSecrets} --secret-string '{
+        "slack_bot_token": "xoxb-YOUR-TOKEN",
+        "slack_signing_secret": "YOUR-SIGNING-SECRET",
+        "slack_channel_id": "C0123456789",
+        "github_token": "ghp_YOUR-TOKEN",
+        "github_username": "your-username",
+        "google_calendar_credentials": "{...}",
+        "google_calendar_id": "primary",
+        "openai_api_key": "sk-YOUR-KEY",
+        "openai_model": "gpt-4-turbo-preview",
+        "timezone": "${Timezone}"
+      }'
